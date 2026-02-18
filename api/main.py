@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -5,13 +6,10 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 from twilio.rest import Client
-import os
 
 app = FastAPI()
 
-# --------------------------------------------------
-# CORS
-# --------------------------------------------------
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,18 +17,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------
-# Twilio ENV (Sandbox)
-# --------------------------------------------------
+# ---------------- ENV ----------------
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH")
-TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # Must be +14155238886
+TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # WhatsApp sandbox number
 
-twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
+twilio_client = Client(TWILIO_SID, TWILIO_AUTH) if TWILIO_SID else None
 
-# --------------------------------------------------
-# ONLY THESE NUMBERS WILL RECEIVE MESSAGE
-# --------------------------------------------------
+# Only these numbers will receive in hackathon demo
 ALLOWED_NUMBERS = [
     "+918329391715",
     "+919867542729",
@@ -38,24 +32,12 @@ ALLOWED_NUMBERS = [
     "+919152274885"
 ]
 
-# --------------------------------------------------
-# Memory Storage
-# --------------------------------------------------
 cluster_memory = {}
 
-# --------------------------------------------------
-# Preprocess
-# --------------------------------------------------
+# ---------------- PREPROCESS ----------------
 def preprocess(df):
     df = df.drop_duplicates()
-
     df["email"] = df["email"].astype(str).str.lower().str.strip()
-    df["phone_number"] = df["phone_number"].astype(str).str.strip()
-
-    # Ensure +91 format
-    df["phone_number"] = df["phone_number"].apply(
-        lambda x: x if x.startswith("+") else "+91" + x
-    )
 
     platform_cols = [
         "whatsapp_usage_minutes_per_week",
@@ -67,12 +49,11 @@ def preprocess(df):
     ]
 
     df["total_engagement"] = df[platform_cols].sum(axis=1)
+    df["most_active_platform"] = df[platform_cols].idxmax(axis=1)
 
     return df
 
-# --------------------------------------------------
-# EXECUTE CAMPAIGN
-# --------------------------------------------------
+# ---------------- EXECUTE CAMPAIGN ----------------
 @app.post("/execute-campaign")
 async def execute_campaign(file: UploadFile = File(...)):
 
@@ -80,44 +61,51 @@ async def execute_campaign(file: UploadFile = File(...)):
     df = preprocess(df)
 
     # Encode
-    df["insurance_encoded"] = LabelEncoder().fit_transform(df["insurance_type"])
-    df["life_event_encoded"] = LabelEncoder().fit_transform(df["life_event"])
+    le_ins = LabelEncoder()
+    le_event = LabelEncoder()
 
-    # Clustering
+    df["insurance_encoded"] = le_ins.fit_transform(df["insurance_type"])
+    df["life_event_encoded"] = le_event.fit_transform(df["life_event"])
+
+    # Cluster
     cluster_features = df[["age", "income_lpa", "total_engagement"]]
-    cluster_scaled = StandardScaler().fit_transform(cluster_features)
+    scaler_cluster = StandardScaler()
+    cluster_scaled = scaler_cluster.fit_transform(cluster_features)
 
     kmeans = KMeans(n_clusters=4, random_state=42)
     df["cluster"] = kmeans.fit_predict(cluster_scaled)
 
     # Propensity
-    model_features = df[[
-        "age",
-        "income_lpa",
-        "total_engagement",
-        "insurance_encoded",
-        "life_event_encoded"
-    ]]
+    model_features = df[
+        ["age", "income_lpa", "total_engagement",
+         "insurance_encoded", "life_event_encoded"]
+    ]
 
-    X_scaled = StandardScaler().fit_transform(model_features)
+    y = df["purchased"]
+
+    scaler_model = StandardScaler()
+    X_scaled = scaler_model.fit_transform(model_features)
 
     model = LogisticRegression(max_iter=500)
-    model.fit(X_scaled, df["purchased"])
+    model.fit(X_scaled, y)
 
     df["purchase_probability"] = model.predict_proba(X_scaled)[:, 1]
 
     segments = []
 
-    for cid in sorted(df["cluster"].unique()):
+    for cid in df["cluster"].unique():
 
         segment_df = df[df["cluster"] == cid]
 
-        customers = segment_df[[
-            "name",
-            "email",
-            "phone_number",
-            "purchase_probability"
-        ]].to_dict(orient="records")
+        dominant_insurance = (
+            segment_df["insurance_type"]
+            .value_counts()
+            .idxmax()
+        )
+
+        customers = segment_df[
+            ["name", "email", "phone_number", "purchase_probability"]
+        ].to_dict(orient="records")
 
         cluster_memory[int(cid)] = customers
 
@@ -126,60 +114,58 @@ async def execute_campaign(file: UploadFile = File(...)):
             "customer_count": len(segment_df),
             "average_purchase_probability":
                 round(float(segment_df["purchase_probability"].mean()), 4),
+            "insurance_type": dominant_insurance,
             "recommended_channel": "whatsapp",
-            "customers_preview": customers[:5]  # preview only
+            "customers_preview": customers[:5]
         })
 
     return {
         "total_customers": len(df),
+        "overall_expected_conversion":
+            round(float(df["purchase_probability"].mean()), 4),
         "segments": segments
     }
 
-# --------------------------------------------------
-# SEND CAMPAIGN (SAFE MODE)
-# --------------------------------------------------
+# ---------------- SEND CAMPAIGN ----------------
 @app.post("/send-campaign")
 async def send_campaign(payload: dict):
 
-    cluster_id = payload.get("cluster_id")
+    cluster_id = int(payload.get("cluster_id"))
     message = payload.get("message")
+    channel = payload.get("channel", "whatsapp")
 
     if cluster_id not in cluster_memory:
         return {"error": "Cluster not found"}
 
     customers = cluster_memory[cluster_id]
-
     sent = 0
     failed = 0
 
-    # ONLY send to teammate numbers
-    for phone in ALLOWED_NUMBERS:
+    for c in customers:
+        phone = str(c["phone_number"]).strip()
+
+        if phone not in ALLOWED_NUMBERS:
+            continue
+
+        if not twilio_client:
+            continue
 
         try:
-            msg = twilio_client.messages.create(
+            twilio_client.messages.create(
                 body=message,
-                from_="whatsapp:" + TWILIO_NUMBER,
-                to="whatsapp:" + phone
+                from_=f"whatsapp:{TWILIO_NUMBER}",
+                to=f"whatsapp:{phone}"
             )
-
-            print("Sent to:", phone, "SID:", msg.sid)
             sent += 1
-
-        except Exception as e:
-            print("Error:", str(e))
+        except Exception:
             failed += 1
 
     return {
         "cluster_id": cluster_id,
         "messages_sent": sent,
-        "failed": failed,
-        "channel": "whatsapp",
-        "note": "Only teammate numbers targeted"
+        "failed": failed
     }
 
-# --------------------------------------------------
-# HEALTH
-# --------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "Innovesis Hackathon Backend Live"}
+    return {"status": "Backend Running"}
