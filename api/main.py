@@ -127,6 +127,7 @@ async def execute_campaign(file: UploadFile = File(...)):
     }
 
 # ---------------- SEND CAMPAIGN ----------------
+
 @app.post("/send-campaign")
 async def send_campaign(payload: dict):
 
@@ -142,22 +143,38 @@ async def send_campaign(payload: dict):
     failed = 0
 
     for c in customers:
-        phone = str(c["phone_number"]).strip()
 
-        if phone not in ALLOWED_NUMBERS:
+        raw_phone = str(c["phone_number"]).strip().replace(" ", "")
+
+        # Normalize to +91 format
+        if not raw_phone.startswith("+"):
+            if raw_phone.startswith("91"):
+                raw_phone = "+" + raw_phone
+            else:
+                raw_phone = "+91" + raw_phone
+
+        print("Checking number:", raw_phone)
+
+        if raw_phone not in ALLOWED_NUMBERS:
+            print("Skipped (not in allowed list):", raw_phone)
             continue
 
         if not twilio_client:
+            print("Twilio client not initialized")
             continue
 
         try:
-            twilio_client.messages.create(
+            msg = twilio_client.messages.create(
                 body=message,
                 from_=f"whatsapp:{TWILIO_NUMBER}",
-                to=f"whatsapp:{phone}"
+                to=f"whatsapp:{raw_phone}"
             )
+
+            print("Message sent to:", raw_phone, "SID:", msg.sid)
             sent += 1
-        except Exception:
+
+        except Exception as e:
+            print("TWILIO ERROR:", str(e))
             failed += 1
 
     return {
@@ -165,7 +182,6 @@ async def send_campaign(payload: dict):
         "messages_sent": sent,
         "failed": failed
     }
-
 @app.get("/")
 def root():
     return {"status": "Backend Running"}
