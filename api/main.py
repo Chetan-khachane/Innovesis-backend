@@ -20,18 +20,26 @@ app.add_middleware(
 )
 
 # --------------------------------------------------
-# Twilio ENV
+# Twilio ENV (Sandbox)
 # --------------------------------------------------
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH")
-TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # Sandbox number
+TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # Must be +14155238886
 
-twilio_client = None
-if TWILIO_SID and TWILIO_AUTH:
-    twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
+twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
 
 # --------------------------------------------------
-# Memory
+# ONLY THESE NUMBERS WILL RECEIVE MESSAGE
+# --------------------------------------------------
+ALLOWED_NUMBERS = [
+    "+918329391715",
+    "+919867542729",
+    "+918097783653",
+    "+919152274885"
+]
+
+# --------------------------------------------------
+# Memory Storage
 # --------------------------------------------------
 cluster_memory = {}
 
@@ -39,13 +47,12 @@ cluster_memory = {}
 # Preprocess
 # --------------------------------------------------
 def preprocess(df):
-
     df = df.drop_duplicates()
 
     df["email"] = df["email"].astype(str).str.lower().str.strip()
     df["phone_number"] = df["phone_number"].astype(str).str.strip()
 
-    # Auto add +91 if missing
+    # Ensure +91 format
     df["phone_number"] = df["phone_number"].apply(
         lambda x: x if x.startswith("+") else "+91" + x
     )
@@ -64,7 +71,7 @@ def preprocess(df):
     return df
 
 # --------------------------------------------------
-# Execute Campaign
+# EXECUTE CAMPAIGN
 # --------------------------------------------------
 @app.post("/execute-campaign")
 async def execute_campaign(file: UploadFile = File(...)):
@@ -73,11 +80,8 @@ async def execute_campaign(file: UploadFile = File(...)):
     df = preprocess(df)
 
     # Encode
-    le_ins = LabelEncoder()
-    le_event = LabelEncoder()
-
-    df["insurance_encoded"] = le_ins.fit_transform(df["insurance_type"])
-    df["life_event_encoded"] = le_event.fit_transform(df["life_event"])
+    df["insurance_encoded"] = LabelEncoder().fit_transform(df["insurance_type"])
+    df["life_event_encoded"] = LabelEncoder().fit_transform(df["life_event"])
 
     # Clustering
     cluster_features = df[["age", "income_lpa", "total_engagement"]]
@@ -86,7 +90,7 @@ async def execute_campaign(file: UploadFile = File(...)):
     kmeans = KMeans(n_clusters=4, random_state=42)
     df["cluster"] = kmeans.fit_predict(cluster_scaled)
 
-    # Propensity Model
+    # Propensity
     model_features = df[[
         "age",
         "income_lpa",
@@ -96,6 +100,7 @@ async def execute_campaign(file: UploadFile = File(...)):
     ]]
 
     X_scaled = StandardScaler().fit_transform(model_features)
+
     model = LogisticRegression(max_iter=500)
     model.fit(X_scaled, df["purchased"])
 
@@ -122,18 +127,16 @@ async def execute_campaign(file: UploadFile = File(...)):
             "average_purchase_probability":
                 round(float(segment_df["purchase_probability"].mean()), 4),
             "recommended_channel": "whatsapp",
-            "customers_preview": customers[:10]
+            "customers_preview": customers[:5]  # preview only
         })
 
     return {
         "total_customers": len(df),
-        "overall_expected_conversion":
-            round(float(df["purchase_probability"].mean()), 4),
         "segments": segments
     }
 
 # --------------------------------------------------
-# Send Campaign
+# SEND CAMPAIGN (SAFE MODE)
 # --------------------------------------------------
 @app.post("/send-campaign")
 async def send_campaign(payload: dict):
@@ -149,34 +152,34 @@ async def send_campaign(payload: dict):
     sent = 0
     failed = 0
 
-    for c in customers:
-
-        phone = str(c["phone_number"]).strip()
+    # ONLY send to teammate numbers
+    for phone in ALLOWED_NUMBERS:
 
         try:
-            if twilio_client:
-                msg = twilio_client.messages.create(
-                    body=message,
-                    from_="whatsapp:" + TWILIO_NUMBER,
-                    to="whatsapp:" + phone
-                )
-                print("Sent to:", phone, msg.sid)
-                sent += 1
+            msg = twilio_client.messages.create(
+                body=message,
+                from_="whatsapp:" + TWILIO_NUMBER,
+                to="whatsapp:" + phone
+            )
+
+            print("Sent to:", phone, "SID:", msg.sid)
+            sent += 1
+
         except Exception as e:
-            print("ERROR:", str(e))
+            print("Error:", str(e))
             failed += 1
 
     return {
         "cluster_id": cluster_id,
         "messages_sent": sent,
         "failed": failed,
-        "channel": "whatsapp"
+        "channel": "whatsapp",
+        "note": "Only teammate numbers targeted"
     }
 
 # --------------------------------------------------
-# Health Check
+# HEALTH
 # --------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "Innovesis Backend Running"}
-
+    return {"status": "Innovesis Hackathon Backend Live"}
