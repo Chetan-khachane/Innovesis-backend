@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -10,9 +9,9 @@ import os
 
 app = FastAPI()
 
-# -------------------------------------------------
+# --------------------------------------------------
 # CORS
-# -------------------------------------------------
+# --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,30 +19,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------------------------
-# Twilio ENV (WhatsApp Sandbox)
-# -------------------------------------------------
+# --------------------------------------------------
+# Twilio ENV
+# --------------------------------------------------
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH")
-TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # Sandbox number: +14155238886
+TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # Sandbox number
 
 twilio_client = None
 if TWILIO_SID and TWILIO_AUTH:
     twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
 
-# -------------------------------------------------
-# In-Memory Cluster Storage
-# -------------------------------------------------
+# --------------------------------------------------
+# Memory
+# --------------------------------------------------
 cluster_memory = {}
 
-# -------------------------------------------------
+# --------------------------------------------------
 # Preprocess
-# -------------------------------------------------
+# --------------------------------------------------
 def preprocess(df):
 
     df = df.drop_duplicates()
 
-    # Force correct types
     df["email"] = df["email"].astype(str).str.lower().str.strip()
     df["phone_number"] = df["phone_number"].astype(str).str.strip()
 
@@ -65,16 +63,16 @@ def preprocess(df):
 
     return df
 
-# -------------------------------------------------
-# EXECUTE CAMPAIGN (Clustering + Propensity)
-# -------------------------------------------------
+# --------------------------------------------------
+# Execute Campaign
+# --------------------------------------------------
 @app.post("/execute-campaign")
 async def execute_campaign(file: UploadFile = File(...)):
 
     df = pd.read_csv(file.file)
     df = preprocess(df)
 
-    # Encode categorical features
+    # Encode
     le_ins = LabelEncoder()
     le_event = LabelEncoder()
 
@@ -83,8 +81,7 @@ async def execute_campaign(file: UploadFile = File(...)):
 
     # Clustering
     cluster_features = df[["age", "income_lpa", "total_engagement"]]
-    scaler_cluster = StandardScaler()
-    cluster_scaled = scaler_cluster.fit_transform(cluster_features)
+    cluster_scaled = StandardScaler().fit_transform(cluster_features)
 
     kmeans = KMeans(n_clusters=4, random_state=42)
     df["cluster"] = kmeans.fit_predict(cluster_scaled)
@@ -98,19 +95,15 @@ async def execute_campaign(file: UploadFile = File(...)):
         "life_event_encoded"
     ]]
 
-    y = df["purchased"]
-
-    scaler_model = StandardScaler()
-    X_scaled = scaler_model.fit_transform(model_features)
-
+    X_scaled = StandardScaler().fit_transform(model_features)
     model = LogisticRegression(max_iter=500)
-    model.fit(X_scaled, y)
+    model.fit(X_scaled, df["purchased"])
 
     df["purchase_probability"] = model.predict_proba(X_scaled)[:, 1]
 
     segments = []
 
-    for cid in df["cluster"].unique():
+    for cid in sorted(df["cluster"].unique()):
 
         segment_df = df[df["cluster"] == cid]
 
@@ -139,9 +132,9 @@ async def execute_campaign(file: UploadFile = File(...)):
         "segments": segments
     }
 
-# -------------------------------------------------
-# SEND WHATSAPP CAMPAIGN
-# -------------------------------------------------
+# --------------------------------------------------
+# Send Campaign
+# --------------------------------------------------
 @app.post("/send-campaign")
 async def send_campaign(payload: dict):
 
@@ -167,22 +160,23 @@ async def send_campaign(payload: dict):
                     from_="whatsapp:" + TWILIO_NUMBER,
                     to="whatsapp:" + phone
                 )
-                print("Sent to:", phone, "SID:", msg.sid)
+                print("Sent to:", phone, msg.sid)
                 sent += 1
         except Exception as e:
-            print("ERROR sending to", phone, ":", str(e))
+            print("ERROR:", str(e))
             failed += 1
 
     return {
         "cluster_id": cluster_id,
-        "channel": "whatsapp",
         "messages_sent": sent,
-        "failed": failed
+        "failed": failed,
+        "channel": "whatsapp"
     }
 
-# -------------------------------------------------
-# HEALTH CHECK
-# -------------------------------------------------
+# --------------------------------------------------
+# Health Check
+# --------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "WhatsApp Marketing Backend Running"}
+    return {"status": "Innovesis Backend Running"}
+
