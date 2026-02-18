@@ -10,9 +10,9 @@ import os
 
 app = FastAPI()
 
-# -----------------------------
+# -------------------------------------------------
 # CORS
-# -----------------------------
+# -------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,28 +20,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Twilio WhatsApp Sandbox ENV
-# -----------------------------
+# -------------------------------------------------
+# Twilio ENV (WhatsApp Sandbox)
+# -------------------------------------------------
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH")
-TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # +14155238886
+TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")  # Sandbox number: +14155238886
 
 twilio_client = None
 if TWILIO_SID and TWILIO_AUTH:
     twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
 
-# -----------------------------
-# Memory Storage
-# -----------------------------
+# -------------------------------------------------
+# In-Memory Cluster Storage
+# -------------------------------------------------
 cluster_memory = {}
 
-# -----------------------------
+# -------------------------------------------------
 # Preprocess
-# -----------------------------
+# -------------------------------------------------
 def preprocess(df):
+
     df = df.drop_duplicates()
-    df["email"] = df["email"].str.lower().str.strip()
+
+    # Force correct types
+    df["email"] = df["email"].astype(str).str.lower().str.strip()
+    df["phone_number"] = df["phone_number"].astype(str).str.strip()
+
+    # Auto add +91 if missing
+    df["phone_number"] = df["phone_number"].apply(
+        lambda x: x if x.startswith("+") else "+91" + x
+    )
 
     platform_cols = [
         "whatsapp_usage_minutes_per_week",
@@ -53,33 +62,40 @@ def preprocess(df):
     ]
 
     df["total_engagement"] = df[platform_cols].sum(axis=1)
+
     return df
 
-# -----------------------------
-# Execute Campaign
-# -----------------------------
+# -------------------------------------------------
+# EXECUTE CAMPAIGN (Clustering + Propensity)
+# -------------------------------------------------
 @app.post("/execute-campaign")
 async def execute_campaign(file: UploadFile = File(...)):
 
     df = pd.read_csv(file.file)
     df = preprocess(df)
 
+    # Encode categorical features
     le_ins = LabelEncoder()
     le_event = LabelEncoder()
 
     df["insurance_encoded"] = le_ins.fit_transform(df["insurance_type"])
     df["life_event_encoded"] = le_event.fit_transform(df["life_event"])
 
-    cluster_features = df[["age","income_lpa","total_engagement"]]
+    # Clustering
+    cluster_features = df[["age", "income_lpa", "total_engagement"]]
     scaler_cluster = StandardScaler()
     cluster_scaled = scaler_cluster.fit_transform(cluster_features)
 
     kmeans = KMeans(n_clusters=4, random_state=42)
     df["cluster"] = kmeans.fit_predict(cluster_scaled)
 
+    # Propensity Model
     model_features = df[[
-        "age","income_lpa","total_engagement",
-        "insurance_encoded","life_event_encoded"
+        "age",
+        "income_lpa",
+        "total_engagement",
+        "insurance_encoded",
+        "life_event_encoded"
     ]]
 
     y = df["purchased"]
@@ -90,7 +106,7 @@ async def execute_campaign(file: UploadFile = File(...)):
     model = LogisticRegression(max_iter=500)
     model.fit(X_scaled, y)
 
-    df["purchase_probability"] = model.predict_proba(X_scaled)[:,1]
+    df["purchase_probability"] = model.predict_proba(X_scaled)[:, 1]
 
     segments = []
 
@@ -99,7 +115,9 @@ async def execute_campaign(file: UploadFile = File(...)):
         segment_df = df[df["cluster"] == cid]
 
         customers = segment_df[[
-            "name","email","phone_number",
+            "name",
+            "email",
+            "phone_number",
             "purchase_probability"
         ]].to_dict(orient="records")
 
@@ -109,19 +127,21 @@ async def execute_campaign(file: UploadFile = File(...)):
             "cluster_id": int(cid),
             "customer_count": len(segment_df),
             "average_purchase_probability":
-                round(float(segment_df["purchase_probability"].mean()),4),
+                round(float(segment_df["purchase_probability"].mean()), 4),
             "recommended_channel": "whatsapp",
-            "customers": customers[:10]
+            "customers_preview": customers[:10]
         })
 
     return {
         "total_customers": len(df),
+        "overall_expected_conversion":
+            round(float(df["purchase_probability"].mean()), 4),
         "segments": segments
     }
 
-# -----------------------------
-# Send WhatsApp Campaign
-# -----------------------------
+# -------------------------------------------------
+# SEND WHATSAPP CAMPAIGN
+# -------------------------------------------------
 @app.post("/send-campaign")
 async def send_campaign(payload: dict):
 
@@ -134,10 +154,11 @@ async def send_campaign(payload: dict):
     customers = cluster_memory[cluster_id]
 
     sent = 0
+    failed = 0
 
     for c in customers:
 
-        phone = c["phone_number"]
+        phone = str(c["phone_number"]).strip()
 
         try:
             if twilio_client:
@@ -146,17 +167,22 @@ async def send_campaign(payload: dict):
                     from_="whatsapp:" + TWILIO_NUMBER,
                     to="whatsapp:" + phone
                 )
-                print("Sent:", msg.sid)
+                print("Sent to:", phone, "SID:", msg.sid)
                 sent += 1
         except Exception as e:
-            print("ERROR:", str(e))
+            print("ERROR sending to", phone, ":", str(e))
+            failed += 1
 
     return {
         "cluster_id": cluster_id,
+        "channel": "whatsapp",
         "messages_sent": sent,
-        "channel": "whatsapp"
+        "failed": failed
     }
 
+# -------------------------------------------------
+# HEALTH CHECK
+# -------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "WhatsApp Backend Running"}
+    return {"status": "WhatsApp Marketing Backend Running"}
